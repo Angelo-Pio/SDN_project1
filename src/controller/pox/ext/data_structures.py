@@ -1,8 +1,9 @@
-
 from typing import *
 import networkx as nx
-from datetime import time
+from datetime import datetime
 from dataclasses import dataclass, field
+from pox.lib.util import dpid_to_str
+from pox.openflow.libopenflow_01 import ofp_flow_mod, ofp_action_output
 
 
 # For each training procedure v you need to mantain:
@@ -64,8 +65,6 @@ class OVSSwitch:
         """
         Install a flow rule on this switch via its POX connection.
         """
-        from pox.lib.util import dpid_to_str
-        from pox.openflow.libopenflow_01 import ofp_flow_mod, ofp_action_output
 
         if not self.connection:
             raise RuntimeError(f"Switch {self.name} has no active connection")
@@ -112,6 +111,7 @@ class Link:
     dst_port: int       # Port number on the destination switch
     nominal_bandwidth: float = 100.0   # Mbps — useful for weighted routing
     residual_bandwidth: float = 100.0          # ms
+    delay: float = 1.0
     is_up: bool = True
 
     def reverse(self) -> "Link":
@@ -136,7 +136,7 @@ class Topology:
         )
         # Also cross-populate the port neighbor info on each switch
         src_sw = self.get_switch(link.src_dpid)
-        dst_sw = self.get_switch(link.dst_dpid)
+        # dst_sw = self.get_switch(link.dst_dpid)
         if src_sw and link.src_port in src_sw.ports:
             src_sw.ports[link.src_port].neighbor_dpid = link.dst_dpid
             src_sw.ports[link.src_port].neighbor_port = link.dst_port
@@ -155,38 +155,43 @@ class Topology:
             sw = self.get_switch(dpid)
             port = sw.get_port_toward(next_dpid)
             if port:
-                from pox.openflow.libopenflow_01 import ofp_action_output
                 sw.send_flow_mod(
                     match=match_template,
                     actions=[ofp_action_output(port=port.port_no)]
                 )
 
+@dataclass
 class Worker:
-  ip : str
-  flow_id : int
+    ip: str
+    flow_id: int
+    connected_to_dpid: Optional[int] = None
+    connected_port: Optional[int] = None
 
+@dataclass
 class Collector:
-  ip : str
-  flow_id : int
+    ip: str
+    flow_id: int
+    connected_to_dpid: Optional[int] = None
+    connected_port: Optional[int] = None
     
+@dataclass
 class Flow:
-  ID : int 
-  workers : List[Worker]
-  collector : Collector
-  Dv : int 
-  Tv : int
-  phase : float
-  sTime : time 
-  ftime : time
+    ID: str 
+    workers: List[Worker] = field(default_factory=list)
+    collector: Optional[Collector] = None
+    D: int = 0
+    completion_time: int = 0
+    phase: float = 0.0
+    sTime: Optional[datetime] = None 
+    ftime: Optional[datetime] = None
 
+@dataclass
 class TrainingProcedure:
-  
-  flows : List[Flow]
-  D : int 
-  Dv : int 
-  Tv : int
-  phase : float
-  K : int 
+    flows: List[Flow] = field(default_factory=list)
+    D: int = 0
+    completion_time: int = 0
+    phase: float = 0.0
+    K: int = 0
   
 training_procedures : List[TrainingProcedure] = []
   
