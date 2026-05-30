@@ -3,7 +3,7 @@ import networkx as nx
 from datetime import datetime
 from dataclasses import dataclass, field
 from pox.lib.util import dpid_to_str
-from pox.openflow.libopenflow_01 import ofp_flow_mod, ofp_action_output
+from pox.openflow.libopenflow_01 import ofp_flow_mod, ofp_action_output, OFPFF_SEND_FLOW_REM
 
 
 # For each training procedure v you need to mantain:
@@ -74,6 +74,7 @@ class OVSSwitch:
         msg.priority = priority
         msg.idle_timeout = idle_timeout
         msg.hard_timeout = hard_timeout
+        msg.flags = OFPFF_SEND_FLOW_REM
         msg.actions = actions
         self.connection.send(msg)
 
@@ -136,10 +137,13 @@ class Topology:
         )
         # Also cross-populate the port neighbor info on each switch
         src_sw = self.get_switch(link.src_dpid)
-        # dst_sw = self.get_switch(link.dst_dpid)
+        dst_sw = self.get_switch(link.dst_dpid)
         if src_sw and link.src_port in src_sw.ports:
             src_sw.ports[link.src_port].neighbor_dpid = link.dst_dpid
             src_sw.ports[link.src_port].neighbor_port = link.dst_port
+        if dst_sw and link.dst_port in dst_sw.ports:
+            dst_sw.ports[link.dst_port].neighbor_dpid = link.src_dpid
+            dst_sw.ports[link.dst_port].neighbor_port = link.src_port
 
     def get_switch(self, dpid: int) -> Optional[OVSSwitch]:
         node = self.graph.nodes.get(dpid)
@@ -157,7 +161,8 @@ class Topology:
             if port:
                 sw.send_flow_mod(
                     match=match_template,
-                    actions=[ofp_action_output(port=port.port_no)]
+                    actions=[ofp_action_output(port=port.port_no)],
+                    idle_timeout=5
                 )
 
 @dataclass
@@ -176,7 +181,7 @@ class Collector:
     
 @dataclass
 class Flow:
-    ID: str 
+    ID: int 
     workers: List[Worker] = field(default_factory=list)
     collector: Optional[Collector] = None
     D: int = 0
@@ -187,6 +192,7 @@ class Flow:
 
 @dataclass
 class TrainingProcedure:
+    id: int
     flows: List[Flow] = field(default_factory=list)
     D: int = 0
     completion_time: int = 0

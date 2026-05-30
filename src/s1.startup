@@ -23,4 +23,5 @@ ovs-vsctl add-port s1 eth2
 ovs-vsctl add-port s1 eth3
 ovs-vsctl add-port s1 eth4
 
+ovs-vsctl set bridge s1 other-config:datapath-id=0000000000000065
 ovs-vsctl set-controller s1 tcp:20.0.1.100
