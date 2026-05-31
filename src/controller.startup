@@ -1,9 +1,10 @@
 ip address add 20.0.1.100/24 dev eth0
 
-apt-get update
-apt-get install -y python3-pip
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
 pip3 install networkx --break-system-packages
 
 chmod +x /pox/pox.py
 
-pox/pox.py log.level --INFO openflow.of_01 --port=6653 load_balancing < /dev/null > /var/log/pox.log 2>&1 &
+# pox/pox.py log.level --INFO openflow.of_01 --port=6653 load_balancing < /dev/null > /var/log/pox.log 2>&1 &
+
+# pox/pox.py log.level --INFO openflow.of_01 --port=6653 load_balancing
