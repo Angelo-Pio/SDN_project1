@@ -48,8 +48,6 @@ class LoadBalancer:
             4: flow4
         }
 
-
-
     def populate_static_topology(self):
         # 2 Spines, 5 Leaves
         # Ensure DPIDs are integers matching what OVS passes to POX
@@ -97,6 +95,17 @@ class LoadBalancer:
         msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         event.connection.send(msg)
         log.info(f"Installed ARP flood rule on switch {event.dpid}")
+        
+        # Proactively drop IPv6 traffic (keeps logs clean from discovery noise)
+        msg_ipv6 = of.ofp_flow_mod()
+        msg_ipv6.match = of.ofp_match(dl_type=0x86dd)
+        event.connection.send(msg_ipv6)
+        
+        # Proactively drop DNS (Port 53) and mDNS (Port 5353) to prevent POX parsing bugs
+        for port in [53, 5353]:
+            msg_dns = of.ofp_flow_mod()
+            msg_dns.match = of.ofp_match(dl_type=0x0800, nw_proto=17, tp_dst=port)
+            event.connection.send(msg_dns)
 
     def _handle_PacketIn(self, event):
         packet = event.parsed
@@ -153,16 +162,23 @@ class LoadBalancer:
             # Calculate expected throughput C / K (where C is the 100 Mbps link capacity)
             estimated_rate = 100.0 / tp.K
             
-            log.info(f"New burst from {src_ip} (Flow {flow_id}, TP {tp_id}). K={tp.K}, Est Rate={estimated_rate:.2f} Mbps")
+            log.info(f"New burst from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). K={tp.K}, Est Rate={estimated_rate:.2f} Mbps")
             
             self.route_worker_to_collector(worker, collector, self.topology, estimated_rate)
 
-            # TODO: find data rate and/or install flow rules
+            # Re-inject the TCP SYN packet back into the switch so it isn't dropped
+            msg = of.ofp_packet_out(buffer_id=event.ofp.buffer_id, in_port=in_port)
+            if event.ofp.buffer_id == -1:
+                msg.data = event.ofp
+            msg.actions.append(of.ofp_action_output(port=of.OFPP_TABLE))
+            event.connection.send(msg)
+
+        # TODO: find data rate and/or install flow rules
 
     def register_or_update_worker(self, ip: str, dpid: int, port: int, flow: Flow):
         for w in flow.workers:
             if w.ip == ip:
-                return w
+                return None # Suppress duplicate packets within the same burst
                 
         # New worker detected!
         new_worker = Worker(ip=ip, flow_id=flow.ID, connected_to_dpid=dpid, connected_port=port)
@@ -205,14 +221,26 @@ class LoadBalancer:
                 u, v = path[i], path[i+1]
                 graph[u][v]["link"].residual_bandwidth -= estimated_rate
                 
-            # Install the rules step-by-step to open flow paths
-            topo.install_path(path, match_template=of.ofp_match(dl_type=0x0800, nw_src=worker.ip))
+            # Install the forward path rules
+            topo.install_path(path, match_template=of.ofp_match(dl_type=0x0800, nw_src=worker.ip, nw_dst=collector.ip))
+            
+            # Install reverse path for TCP return traffic (SYN-ACK)
+            reverse_path = path[::-1]
+            topo.install_path(reverse_path, match_template=of.ofp_match(dl_type=0x0800, nw_src=collector.ip, nw_dst=worker.ip))
             
             # Don't forget the final hop out of the destination switch to the collector itself!
             dest_sw = topo.get_switch(collector.connected_to_dpid)
             dest_sw.send_flow_mod(
-                match=of.ofp_match(dl_type=0x0800, nw_src=worker.ip),
+                match=of.ofp_match(dl_type=0x0800, nw_src=worker.ip, nw_dst=collector.ip),
                 actions=[of.ofp_action_output(port=collector.connected_port)],
+                idle_timeout=5
+            )
+
+            # Final hop back out of the source switch to the worker!
+            src_sw = topo.get_switch(worker.connected_to_dpid)
+            src_sw.send_flow_mod(
+                match=of.ofp_match(dl_type=0x0800, nw_src=collector.ip, nw_dst=worker.ip),
+                actions=[of.ofp_action_output(port=worker.connected_port)],
                 idle_timeout=5
             )
             
@@ -257,7 +285,7 @@ class LoadBalancer:
                             if flow.sTime:
                                 flow.completion_time = (flow.ftime - flow.sTime).total_seconds()
                         
-                        log.info(f"Worker {src_ip_str} finished burst for TP {tp_id}. Flow bytes: {event.ofp.byte_count}")
+                        log.info(f"Worker {src_ip_str} finished burst for Cycle {tp_id + 1}. Flow bytes: {event.ofp.byte_count}")
                         
                         # Advance worker to the next overlapping TP iteration
                         self.worker_tp_ids[src_ip_str] = tp_id + 1
@@ -268,7 +296,8 @@ class LoadBalancer:
         for dpid in self.topology.graph.nodes:
             sw = self.topology.get_switch(dpid)
             if sw and sw.is_connected:
-                sw.connection.send(of.ofp_port_stats_request())
+                msg = of.ofp_stats_request(body=of.ofp_port_stats_request())
+                sw.connection.send(msg)
                 
     def _handle_PortStatsReceived(self, event):
         dpid = event.dpid
@@ -305,7 +334,7 @@ class LoadBalancer:
                 flow = next((f for f in tp.flows if f.ID == flow_id), None)
                 if flow and flow.sTime and not flow.ftime:
                     uptime = (datetime.now() - flow.sTime).total_seconds()
-                    log.info(f"Flow {flow.ID} (Worker {ip}) - TP {tp.id} active for {uptime:.2f}s...")
+                    log.info(f"Flow {flow.ID} (Worker {ip}) - Cycle {tp.id + 1} active for {uptime:.2f}s...")
 
     def estimate_tp_data(self):
         # TODO: estimate the quantities requested in the text for a training procedure
@@ -324,7 +353,7 @@ class LoadBalancer:
                 
                 if start_time and end_time:
                     tp.completion_time = (end_time - start_time).total_seconds()
-                    log.info(f"TP {tp.id} - Completed! D={tp.D} bytes, K={tp.K}, Total Time={tp.completion_time:.2f}s")
+                    log.info(f"Cycle {tp.id + 1} - Completed! Total bytes: {tp.D}, Active Workers K={tp.K}, Time={tp.completion_time:.2f}s")
 
 def launch():
     log.info("Launching Load Balancer application...")
