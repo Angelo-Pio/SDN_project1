@@ -53,3 +53,4 @@ ovs-vsctl add-port l1 eth11
 
 ovs-vsctl set bridge l1 other-config:datapath-id=0000000000000001
 ovs-vsctl set-controller l1 tcp:20.0.1.100
+ovs-vsctl set-fail-mode l1 secure

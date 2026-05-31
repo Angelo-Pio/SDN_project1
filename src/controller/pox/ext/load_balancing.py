@@ -1,12 +1,10 @@
 from data_structures import *
 from pox.core import core
-from pox.openflow.libopenflow_01 import *
+import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 import networkx as nx
 from datetime import datetime
 from pox.lib.recoco import Timer
-
-# Currently trying to fix switches not connecting and installing networkx in controller
 
 log = core.getLogger()
 
@@ -28,10 +26,10 @@ class LoadBalancer:
         log.info("LoadBalancer initialized. Recurring checks started.")
 
     def populate_mappings(self):
-        collector1 = Collector(ip="10.0.1.1", flow_id=1, connected_to_dpid=3, connected_port=0)
-        collector2 = Collector(ip="10.0.1.2", flow_id=2, connected_to_dpid=3, connected_port=1)
-        collector3 = Collector(ip="10.0.1.3", flow_id=3, connected_to_dpid=3, connected_port=2)
-        collector4 = Collector(ip="10.0.1.4", flow_id=4, connected_to_dpid=3, connected_port=3)
+        collector1 = Collector(ip="10.0.1.1", flow_id=1, connected_to_dpid=3, connected_port=1)
+        collector2 = Collector(ip="10.0.1.2", flow_id=2, connected_to_dpid=3, connected_port=2)
+        collector3 = Collector(ip="10.0.1.3", flow_id=3, connected_to_dpid=3, connected_port=3)
+        collector4 = Collector(ip="10.0.1.4", flow_id=4, connected_to_dpid=3, connected_port=4)
         self.collectors = {
             1: collector1,
             2: collector2,
@@ -73,16 +71,16 @@ class LoadBalancer:
             topo.add_switch(sw)
         
         # Fix
-        topo.add_link(Link(src_dpid=1, dst_dpid=101, src_port=0, dst_port=0))
-        topo.add_link(Link(src_dpid=1, dst_dpid=102, src_port=1, dst_port=0))
-        topo.add_link(Link(src_dpid=2, dst_dpid=101, src_port=0, dst_port=1))
-        topo.add_link(Link(src_dpid=2, dst_dpid=102, src_port=1, dst_port=1))
-        topo.add_link(Link(src_dpid=3, dst_dpid=101, src_port=0, dst_port=2))
-        topo.add_link(Link(src_dpid=3, dst_dpid=102, src_port=1, dst_port=2))
-        topo.add_link(Link(src_dpid=4, dst_dpid=101, src_port=0, dst_port=3))
-        topo.add_link(Link(src_dpid=4, dst_dpid=102, src_port=1, dst_port=3))
-        topo.add_link(Link(src_dpid=5, dst_dpid=101, src_port=0, dst_port=4))
-        topo.add_link(Link(src_dpid=5, dst_dpid=102, src_port=1, dst_port=4))
+        topo.add_link(Link(src_dpid=1, dst_dpid=101, src_port=11, dst_port=1))
+        topo.add_link(Link(src_dpid=1, dst_dpid=102, src_port=12, dst_port=1))
+        topo.add_link(Link(src_dpid=2, dst_dpid=101, src_port=9,  dst_port=2))
+        topo.add_link(Link(src_dpid=2, dst_dpid=102, src_port=10, dst_port=2))
+        topo.add_link(Link(src_dpid=3, dst_dpid=101, src_port=5,  dst_port=3))
+        topo.add_link(Link(src_dpid=3, dst_dpid=102, src_port=6,  dst_port=3))
+        topo.add_link(Link(src_dpid=4, dst_dpid=101, src_port=7,  dst_port=4))
+        topo.add_link(Link(src_dpid=4, dst_dpid=102, src_port=8,  dst_port=4))
+        topo.add_link(Link(src_dpid=5, dst_dpid=101, src_port=5,  dst_port=5))
+        topo.add_link(Link(src_dpid=5, dst_dpid=102, src_port=6,  dst_port=5))
 
         return topo
 
@@ -94,9 +92,9 @@ class LoadBalancer:
             sw.is_connected = True
             
         # Proactively flood ARP packets so workers can resolve MAC addresses
-        msg = ofp_flow_mod()
-        msg.match = ofp_match(dl_type=0x0806)
-        msg.actions.append(ofp_action_output(port=OFPP_FLOOD))
+        msg = of.ofp_flow_mod()
+        msg.match = of.ofp_match(dl_type=0x0806)
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         event.connection.send(msg)
         log.info(f"Installed ARP flood rule on switch {event.dpid}")
 
@@ -208,13 +206,13 @@ class LoadBalancer:
                 graph[u][v]["link"].residual_bandwidth -= estimated_rate
                 
             # Install the rules step-by-step to open flow paths
-            topo.install_path(path, match_template=ofp_match(dl_type=0x0800, nw_src=worker.ip))
+            topo.install_path(path, match_template=of.ofp_match(dl_type=0x0800, nw_src=worker.ip))
             
             # Don't forget the final hop out of the destination switch to the collector itself!
             dest_sw = topo.get_switch(collector.connected_to_dpid)
             dest_sw.send_flow_mod(
-                match=ofp_match(dl_type=0x0800, nw_src=worker.ip),
-                actions=[ofp_action_output(port=collector.connected_port)],
+                match=of.ofp_match(dl_type=0x0800, nw_src=worker.ip),
+                actions=[of.ofp_action_output(port=collector.connected_port)],
                 idle_timeout=5
             )
             
@@ -270,7 +268,7 @@ class LoadBalancer:
         for dpid in self.topology.graph.nodes:
             sw = self.topology.get_switch(dpid)
             if sw and sw.is_connected:
-                sw.connection.send(ofp_port_stats_request())
+                sw.connection.send(of.ofp_port_stats_request())
                 
     def _handle_PortStatsReceived(self, event):
         dpid = event.dpid

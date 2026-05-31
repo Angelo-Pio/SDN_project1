@@ -135,15 +135,6 @@ class Topology:
             link=link,
             weight=link.delay           # use delay (or 1/bandwidth) for shortest path
         )
-        # Also cross-populate the port neighbor info on each switch
-        src_sw = self.get_switch(link.src_dpid)
-        dst_sw = self.get_switch(link.dst_dpid)
-        if src_sw and link.src_port in src_sw.ports:
-            src_sw.ports[link.src_port].neighbor_dpid = link.dst_dpid
-            src_sw.ports[link.src_port].neighbor_port = link.dst_port
-        if dst_sw and link.dst_port in dst_sw.ports:
-            dst_sw.ports[link.dst_port].neighbor_dpid = link.src_dpid
-            dst_sw.ports[link.dst_port].neighbor_port = link.src_port
 
     def get_switch(self, dpid: int) -> Optional[OVSSwitch]:
         node = self.graph.nodes.get(dpid)
@@ -157,11 +148,12 @@ class Topology:
         for i, dpid in enumerate(path[:-1]):
             next_dpid = path[i + 1]
             sw = self.get_switch(dpid)
-            port = sw.get_port_toward(next_dpid)
-            if port:
+            if sw:
+                link = self.graph[dpid][next_dpid]["link"]
+                port_no = link.src_port if link.src_dpid == dpid else link.dst_port
                 sw.send_flow_mod(
                     match=match_template,
-                    actions=[ofp_action_output(port=port.port_no)],
+                    actions=[ofp_action_output(port=port_no)],
                     idle_timeout=5
                 )
 
