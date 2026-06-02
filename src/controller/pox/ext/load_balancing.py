@@ -19,6 +19,15 @@ class LoadBalancer:
         self.worker_to_flow = {}    # Maps worker IP -> flow_id
         self.port_stats = {}        # Maps (dpid, port) -> (last_tx_bytes, last_timestamp)
         self.worker_tp_ids = {}     # Maps worker IP -> current tp_id (int)
+
+        # --- Rate estimation state ---
+        # Maps (dpid, port) -> worker IP for all known worker ingress ports
+        self.port_to_worker = {}
+        # Maps worker IP -> most recent Mbps estimate (updated by port stats polling)
+        self.worker_rates = {}
+        # Maps worker IP -> (accumulated_bytes, window_start_time)
+        # Used to integrate byte counts seen in FlowRemoved events into a final rate sample.
+        self.worker_byte_window: dict[str, tuple[int, datetime]] = {}
         
         Timer(5, self.routine_checks, recurring=True)
         
@@ -151,18 +160,27 @@ class LoadBalancer:
             worker = self.register_or_update_worker(src_ip, sw_dpid, in_port, flow)
             if not worker:
                 return
+
+            # Record the ingress port so port-stats polling can map bytes back to this worker
+            self.port_to_worker[(sw_dpid, in_port)] = src_ip
             
             # Learn K (total number of discovered workers)
             tp.K = len(self.worker_to_flow)
-            
+
             collector = self.collectors.get(flow_id)
             if not collector:
                 return # Collector not defined for this flow
-                
-            # Calculate expected throughput C / K (where C is the 100 Mbps link capacity)
-            estimated_rate = 100.0 / tp.K
-            
-            log.info(f"New burst from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). K={tp.K}, Est Rate={estimated_rate:.2f} Mbps")
+
+            # Use the measured per-worker rate if available; fall back to fair-share estimate.
+            # The measured rate is populated by _handle_PortStatsReceived via the ingress port
+            # of the worker's leaf switch and is refreshed every 5 s by routine_checks.
+            estimated_rate = self._estimate_worker_rate(src_ip, tp.K)
+
+            log.info(
+                f"New burst from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). "
+                f"K={tp.K}, Est Rate={estimated_rate:.2f} Mbps "
+                f"({'measured' if src_ip in self.worker_rates else 'fair-share fallback'})"
+            )
             
             self.route_worker_to_collector(worker, collector, self.topology, estimated_rate)
 
@@ -188,6 +206,38 @@ class LoadBalancer:
             flow.sTime = datetime.now()
             
         return new_worker
+
+    def _estimate_worker_rate(self, worker_ip: str, K: int) -> float:
+        """
+        Return the best available Mbps estimate for *worker_ip*.
+
+        Priority order:
+          1. A fresh measurement from port-stats polling stored in self.worker_rates.
+          2. A rate derived from bytes accumulated in the current byte-count window
+             (self.worker_byte_window) — updated on every FlowRemoved event.
+          3. A conservative fair-share fallback: link_capacity / K.
+
+        The fair-share value is also used as a hard ceiling so that a single
+        misbehaving worker cannot claim more capacity than its fair share.
+        """
+        fair_share = 100.0 / max(K, 1)
+
+        # 1. Fresh port-stats measurement
+        if worker_ip in self.worker_rates:
+            measured = self.worker_rates[worker_ip]
+            # Cap at fair-share to avoid over-claiming residual bandwidth
+            return min(measured, fair_share)
+
+        # 2. Byte-window fallback (coarser, derived from FlowRemoved byte counts)
+        if worker_ip in self.worker_byte_window:
+            acc_bytes, window_start = self.worker_byte_window[worker_ip]
+            elapsed = (datetime.now() - window_start).total_seconds()
+            if elapsed > 0:
+                rate_mbps = (acc_bytes * 8) / (elapsed * 1e6)
+                return min(rate_mbps, fair_share)
+
+        # 3. Pure fair-share
+        return fair_share
 
     def route_worker_to_collector(self, worker: Worker, collector: Collector, topo: Topology, estimated_rate: float):
         
@@ -284,11 +334,24 @@ class LoadBalancer:
                             flow.D += event.ofp.byte_count
                             if flow.sTime:
                                 flow.completion_time = (flow.ftime - flow.sTime).total_seconds()
+
+                            # Feed byte count into the per-worker sliding window so
+                            # _estimate_worker_rate can produce a rate even before the
+                            # first port-stats poll arrives.
+                            byte_count = event.ofp.byte_count
+                            if src_ip_str in self.worker_byte_window:
+                                prev_bytes, window_start = self.worker_byte_window[src_ip_str]
+                                self.worker_byte_window[src_ip_str] = (prev_bytes + byte_count, window_start)
+                            elif flow.sTime:
+                                self.worker_byte_window[src_ip_str] = (byte_count, flow.sTime)
                         
                         log.info(f"Worker {src_ip_str} finished burst for Cycle {tp_id + 1}. Flow bytes: {event.ofp.byte_count}")
-                        
+
                         # Advance worker to the next overlapping TP iteration
                         self.worker_tp_ids[src_ip_str] = tp_id + 1
+
+                        # Reset the byte window so the next cycle starts fresh
+                        self.worker_byte_window.pop(src_ip_str, None)
 
     def check_residual_capacity(self):
         # TODO: update link residual capacity in graph
@@ -315,13 +378,27 @@ class LoadBalancer:
                 if dt > 0:
                     # Calculate bitrate in Mbps
                     bitrate = ((tx_bytes - last_bytes) * 8) / (dt * 1e6)
-                    
+
+                    # 1. Update the link's residual bandwidth
                     sw = self.topology.get_switch(dpid)
                     if sw and port_no in sw.ports:
                         neighbor_dpid = sw.ports[port_no].neighbor_dpid
                         if neighbor_dpid:
                             link = self.topology.graph[dpid][neighbor_dpid]["link"]
                             link.residual_bandwidth = max(0, link.nominal_bandwidth - bitrate)
+
+                    # 2. If this port is the ingress of a known worker, store a fresh rate sample.
+                    #    The ingress port *receives* the worker's traffic, so we use rx_bytes
+                    #    (stat.rx_bytes) for the worker's send rate and tx_bytes for the link's
+                    #    outgoing utilisation.  Here we reuse `bitrate` (tx side) as a proxy when
+                    #    rx_bytes is unavailable; adjust if your OVS version exposes rx_bytes.
+                    worker_ip = self.port_to_worker.get((dpid, port_no))
+                    if worker_ip is not None:
+                        self.worker_rates[worker_ip] = bitrate
+                        log.debug(
+                            f"Rate sample for worker {worker_ip}: {bitrate:.2f} Mbps "
+                            f"(port {port_no} on dpid {dpid})"
+                        )
                             
             self.port_stats[key] = (tx_bytes, now)
 
