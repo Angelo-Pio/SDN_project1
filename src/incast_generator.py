@@ -274,7 +274,7 @@ def main():
         print(k, "->", v)
 
     print("\nStarting servers...")
-    #start_servers(cmap)
+    start_servers(cmap)
 
     time.sleep(2)
 
