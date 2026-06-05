@@ -177,7 +177,7 @@ class Flow:
     workers: List[Worker] = field(default_factory=list)
     collector: Optional[Collector] = None
     D: int = 0
-    completion_time: int = 0
+    completion_time: float = 0
     phase: float = 0.0
     sTime: Optional[datetime] = None 
     ftime: Optional[datetime] = None
@@ -187,7 +187,7 @@ class TrainingProcedure:
     id: int
     flows: List[Flow] = field(default_factory=list)
     D: int = 0
-    completion_time: int = 0
+    completion_time: float = 0
     phase: float = 0.0
     K: int = 0
   
