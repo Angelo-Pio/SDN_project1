@@ -218,47 +218,81 @@ def run_training(cfg, cmap):
 # PLOT
 # =========================
 def plot_collectors(files):
-    plt.figure()
+    # Fixed size that easily fits comfortably on 1080p+ screens
+    plt.figure(figsize=(10, 6)) 
+    
     for label, fname in files.items():
         t, y = [], []
-        with open(fname) as f:
-            next(f)
-            for line in f:
-                a, b = line.split()
-                t.append(float(a))
-                y.append(float(b))
-        plt.plot(t, y, label=label)
+        try:
+            with open(fname) as f:
+                next(f)
+                for line in f:
+                    a, b = line.split()
+                    t.append(float(a))
+                    y.append(float(b))
+            plt.plot(t, y, label=label)
+        except Exception as e:
+            print(f"[PLOT ERROR] Could not read {fname}: {e}")
 
-    plt.title("Collector RX")
-    plt.xlabel("Time")
+    plt.title("Collector RX Throughput")
+    plt.xlabel("Time (s)")
     plt.ylabel("Mbps")
-    plt.legend()
-    plt.grid()
+    plt.legend(loc="upper right")
+    plt.grid(True)
+    
+    plt.tight_layout() # Ensures everything fits inside the window boundary
     plt.show()
 
 
 def plot_workers(files):
     n = len(files)
-    fig, axes = plt.subplots(n, 1, figsize=(8, 3*n), sharex=True)
+    if n == 0:
+        return
 
+    # Instead of a single vertical column of 'n' height, 
+    # we layout the plots dynamically in a grid (e.g., 4 columns wide)
+    cols = 4
+    rows = (n + cols - 1) // cols  # Math ceiling trick
+
+    # Cap the maximum window size so it doesn't stretch off-screen
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 1.2 * rows), sharex=True)
+
+    # Flatten axes array for easy indexing, even if it's 1D or 2D
     if n == 1:
         axes = [axes]
+    else:
+        axes = axes.flatten()
 
-    for ax, (label, fname) in zip(axes, files.items()):
+    for idx, (label, fname) in enumerate(sorted(files.items(), key=lambda x: int(x[0][1:]))):
+        ax = axes[idx]
         t, y = [], []
-        with open(fname) as f:
-            next(f)
-            for line in f:
-                a, b = line.split()
-                t.append(float(a))
-                y.append(float(b))
+        try:
+            with open(fname) as f:
+                next(f)
+                for line in f:
+                    a, b = line.split()
+                    t.append(float(a))
+                    y.append(float(b))
+            ax.plot(t, y)
+        except Exception as e:
+            ax.text(0.5, 0.5, 'No Data', ha='center', va='center')
+            
+        ax.set_title(label, fontsize=9, pad=2)
+        ax.grid(True)
+        ax.tick_params(axis='both', which='major', labelsize=8)
 
-        ax.plot(t, y)
-        ax.set_title(label)
-        ax.grid()
+    # Hide any unused subplot squares in the grid
+    for idx in range(n, len(axes)):
+        fig.delaxes(axes[idx])
 
-    axes[-1].set_xlabel("Time")
-    fig.suptitle("Worker TX")
+    # Add shared X label to the visible bottom row subplots
+    for ax in axes[-cols:]:
+        ax.set_xlabel("Time (s)", fontsize=9)
+
+    fig.suptitle("Worker TX Throughput Breakdown", fontsize=12, weight='bold')
+    
+    # tight_layout automatically scales text and borders to fit neatly within window frames
+    plt.tight_layout() 
     plt.show()
 
 

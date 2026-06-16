@@ -184,9 +184,9 @@ class LoadBalancer:
             estimated_rate = self._estimate_worker_rate(src_ip, tp.K)
 
             log.info(
-                f"New burst from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). "
-                f"K={tp.K}, Est Rate={estimated_rate:.2f} Mbps "
-                f"({'measured' if src_ip in self.worker_rates else 'fair-share fallback'})"
+                f"New burst starting from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). "
+                f"Initial path allocated at {estimated_rate:.2f} Mbps "
+                f"({'historical' if src_ip in self.worker_rates else 'fair-share fallback'})"
             )
             
             self.route_worker_to_collector(worker, collector, self.topology, estimated_rate)
@@ -222,8 +222,13 @@ class LoadBalancer:
                         if flow:
                             flow.ftime = datetime.now()
                             flow.D += event.ofp.byte_count
-                            if flow.sTime:
-                                flow.completion_time = (flow.ftime - flow.sTime).total_seconds()
+
+                            # The switch waits before sending FlowRemoved. We subtract this idle 
+                            # time using hardware timers to get the exact active duration.
+                            total_duration = event.ofp.duration_sec + (event.ofp.duration_nsec / 1e9)
+                            idle_time = event.ofp.idle_timeout if event.ofp.reason == of.OFPRR_IDLE_TIMEOUT else 0
+                            active_time = max(0.01, total_duration - idle_time)
+                            flow.completion_time = active_time
 
                             # Feed byte count into the per-worker sliding window so
                             # _estimate_worker_rate can use it as a fallback on the
@@ -235,15 +240,13 @@ class LoadBalancer:
                             elif flow.sTime:
                                 self.worker_byte_window[src_ip_str] = (byte_count, flow.sTime)
 
-                            # FIX #5 (secondary): derive a rate from the completed burst
-                            # and store it so the *next* cycle uses it as the priority-1
-                            # estimate instead of fair-share.
-                            if flow.sTime and flow.completion_time > 0:
-                                burst_rate = (byte_count * 8) / (flow.completion_time * 1e6)
+                            # Store the highly accurate hardware-based rate
+                            if byte_count > 0:
+                                burst_rate = (byte_count * 8) / (active_time * 1e6)
                                 self.worker_rates[src_ip_str] = burst_rate
-                                log.debug(
-                                    f"Burst-derived rate for {src_ip_str}: "
-                                    f"{burst_rate:.2f} Mbps over {flow.completion_time:.2f}s"
+                                log.info(
+                                    f"[FINAL RATE] {src_ip_str} completed burst: "
+                                    f"{burst_rate:.2f} Mbps over {active_time:.2f}s active time"
                                 )
 
                         log.info(
@@ -295,20 +298,13 @@ class LoadBalancer:
                     rx_bitrate = ((rx_bytes - last_rx) * 8) / (dt * 1e6)
                     worker_ip = self.port_to_worker.get((dpid, port_no))
                     if worker_ip is not None:
-                        # FIX #4: store the real measured rate WITHOUT capping at
-                        # fair-share. The cap was silently hiding heavy workers and
-                        # causing under-reservation. Log a warning instead.
-                        fair_share = 100.0 / max(len(self.worker_to_flow), 1)
-                        if rx_bitrate > fair_share:
-                            log.warning(
-                                f"Worker {worker_ip} sending {rx_bitrate:.2f} Mbps, "
-                                f"above fair-share of {fair_share:.2f} Mbps"
+                        # Only record and log if there is actual traffic, avoiding 0.0 overwrites
+                        if rx_bitrate > 0.1:
+                            self.worker_rates[worker_ip] = rx_bitrate
+                            log.info(
+                                f"[LIVE RATE] Worker {worker_ip} is actively transmitting at "
+                                f"{rx_bitrate:.2f} Mbps"
                             )
-                        self.worker_rates[worker_ip] = rx_bitrate
-                        log.debug(
-                            f"rx rate sample for worker {worker_ip}: "
-                            f"{rx_bitrate:.2f} Mbps (port {port_no} on dpid {dpid})"
-                        )
             self.port_stats[rx_key] = (rx_bytes, now)
 
     # ------------------------------------------------------------------ #
@@ -350,7 +346,7 @@ class LoadBalancer:
         fair_share = 100.0 / max(K, 1)
 
         # 1. Port-stats rx measurement or previous-burst-derived rate
-        if worker_ip in self.worker_rates:
+        if worker_ip in self.worker_rates and self.worker_rates[worker_ip] > 0:
             return self.worker_rates[worker_ip]
 
         # 2. Byte-window fallback (coarser, derived from FlowRemoved byte counts)
