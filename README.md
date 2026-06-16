@@ -47,3 +47,16 @@ Why: Frees up the virtual capacity back into the residual_bandwidth of the links
 "Cycle {id} - Completed! Total bytes: {bytes}, Active Workers..."
 When: Every 2 seconds, the estimate_tp_data() function checks the status of all workers.
 Why: If the system notices that every single worker assigned to a specific Training Procedure cycle has had a FlowRemoved event triggered, it declares the entire cycle finished and logs the summary stats!
+
+Global stats:
+Total Workers: The count of all unique workers that participated across all flows in this round.
+Total Data: The sum of all bytes sent by all workers in the round.
+Global Completion Time: The total wall-clock time from the very first packet of the round (from any flow) to the completion of the very last packet. This shows the total time the network was busy with the overlapping bursts.
+
+TP stats:
+Kv (Workers): The number of workers in this specific training procedure (e.g., 10 for "blue"). This is your estimated $K_v$.
+Dv (Data/Worker): The average data sent per worker in this procedure. This is your estimated $D_v$.
+Tv (Period): The time between the start of this procedure's burst in the current round and its burst in the previous round. This is your estimated $T_v$. It will be 0.00s for the first round.
+ϕv (Phase): The time offset from the controller's launch to the very first appearance of this training procedure. This is your estimated $\phi_v$.
+Actual Time: The measured duration of this specific procedure's burst, from its first packet to its last. This is the key performance metric you want to minimize.
+Ideal Bound: The theoretical best-case completion time, calculated from the PDF's formula (Total_Data * 8) / 100Mbps. The goal is for your Actual Time to be as close to this value as possible.

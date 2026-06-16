@@ -199,6 +199,7 @@ class Worker:
     flow_id: int
     connected_to_dpid: Optional[int] = None
     connected_port: Optional[int] = None
+    bytes_sent: int = 0
 
 @dataclass
 class Collector:
@@ -215,6 +216,7 @@ class Flow:
     D: int = 0
     completion_time: float = 0.0
     phase: float = 0.0
+    Tv: float = 0.0
     sTime: Optional[datetime] = None 
     ftime: Optional[datetime] = None
 

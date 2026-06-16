@@ -3,7 +3,7 @@ from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 import networkx as nx
-from datetime import datetime
+from datetime import datetime, timedelta
 from pox.lib.recoco import Timer
 
 log = core.getLogger()
@@ -181,31 +181,22 @@ class LoadBalancer:
             self.active_workers.add(src_ip)
             tp.K = max(1, len(self.active_workers))
             
-            if tp.start_time is None:
-                tp.start_time = datetime.now()
-
-                # --- Characterize Phase (ϕv) and Period (Tv) ---
-                # Find the previous cycle that involved this specific flow_id
-                prev_tp_for_this_flow = None
+            # --- Characterize Phase (ϕv) and Period (Tv) per Flow (v) ---
+            if flow.Tv == 0.0 and flow.phase == 0.0 and flow.sTime:
+                prev_flow = None
                 if tp_id > 0:
-                    # This search is inefficient, but acceptable for this project's scale.
-                    # A larger refactor would be needed for a cleaner data model.
-                    for i in range(tp_id - 1, -1, -1):
-                        candidate_tp = training_procedures[i]
-                        if any(f.ID == flow_id for f in candidate_tp.flows):
-                            prev_tp_for_this_flow = candidate_tp
-                            break
+                    prev_tp = training_procedures[tp_id - 1]
+                    prev_flow = next((f for f in prev_tp.flows if f.ID == flow_id), None)
                 
-                if prev_tp_for_this_flow is None:
-                    # No previous cycle found for this flow, so this is the first one.
-                    # Calculate Phase (ϕv).
-                    tp.phase = (tp.start_time - self.app_start_time).total_seconds()
+                if prev_flow is None:
+                    # This is the first time we see this training procedure.
+                    flow.phase = (flow.sTime - self.app_start_time).total_seconds()
                 else:
-                    # A previous cycle was found. Calculate Period (Tv).
-                    if prev_tp_for_this_flow.start_time:
-                        tp.Tv = (tp.start_time - prev_tp_for_this_flow.start_time).total_seconds()
-                    # Copy the phase from the previous cycle, as it's constant for the flow.
-                    tp.phase = prev_tp_for_this_flow.phase
+                    # A previous instance exists. Calculate the period.
+                    if prev_flow.sTime:
+                        flow.Tv = (flow.sTime - prev_flow.sTime).total_seconds()
+                    # Phase is constant, so copy it from the previous instance.
+                    flow.phase = prev_flow.phase
 
             collector = self.collectors.get(flow_id)
             if not collector:
@@ -250,20 +241,26 @@ class LoadBalancer:
                         tp = training_procedures[tp_id]
                         flow = next((f for f in tp.flows if f.ID == flow_id), None)
                         if flow:
-                            flow.ftime = datetime.now()
-                            flow.D += event.ofp.byte_count
-
                             # The switch waits before sending FlowRemoved. We subtract this idle 
                             # time using hardware timers to get the exact active duration.
                             total_duration = event.ofp.duration_sec + (event.ofp.duration_nsec / 1e9)
                             idle_time = event.ofp.idle_timeout if event.ofp.reason == of.OFPRR_IDLE_TIMEOUT else 0
                             active_time = max(0.01, total_duration - idle_time)
-                            flow.completion_time = active_time
+
+                            # Accurately strip the idle_timeout to find the exact hardware stop time
+                            actual_end_time = datetime.now() - timedelta(seconds=idle_time)
+                            if flow.ftime is None or actual_end_time > flow.ftime:
+                                flow.ftime = actual_end_time
+
+                            byte_count = event.ofp.byte_count
+                            flow.D += byte_count
+                            worker_obj = next((w for w in flow.workers if w.ip == src_ip_str), None)
+                            if worker_obj:
+                                worker_obj.bytes_sent += byte_count
 
                             # Feed byte count into the per-worker sliding window so
                             # _estimate_worker_rate can use it as a fallback on the
                             # next cycle before the first port-stats poll arrives.
-                            byte_count = event.ofp.byte_count
                             if src_ip_str in self.worker_byte_window:
                                 prev_bytes, window_start = self.worker_byte_window[src_ip_str]
                                 self.worker_byte_window[src_ip_str] = (prev_bytes + byte_count, window_start)
@@ -596,20 +593,44 @@ class LoadBalancer:
             )
 
             if is_completed and tp.completion_time == 0:
-                start_time = min(
-                    (flow.sTime for flow in tp.flows if flow.sTime), default=None
+                start_time = min((flow.sTime for flow in tp.flows if flow.sTime), default=None)
+                end_time = max((flow.ftime for flow in tp.flows if flow.ftime), default=None)
+                round_duration = (end_time - start_time).total_seconds() if start_time and end_time else 0.0
+                
+                tp.completion_time = round_duration or 1  # Mark the global round as processed
+                
+                log.info(
+                    f"=== ROUND {tp.id + 1} GLOBAL SUMMARY === "
+                    f"Total Workers: {total_cycle_workers}, Total Data: {tp.D} B, "
+                    f"Global Completion Time: {round_duration:.2f}s"
                 )
-                end_time = max(
-                    (flow.ftime for flow in tp.flows if flow.ftime), default=None
-                )
-
-                if start_time and end_time:
-                    tp.completion_time = (end_time - start_time).total_seconds()
+                
+                for flow in tp.flows:
+                    if not flow.workers:
+                        continue
+                        
+                    # Calculate stats for this specific training procedure (v)
+                    flow_K = len(flow.workers)
+                    flow_Dv = int(flow.D / max(1, flow_K))
+                    # Ideal completion time Tv = (Kv*Dv)/Cv, where Cv=100Mbps
+                    ideal_bound = (flow.D * 8) / (100.0 * 1e6)
+                    
+                    # Actual measured completion time for this procedure
+                    actual_duration = 0.0
+                    if flow.sTime and flow.ftime:
+                        actual_duration = (flow.ftime - flow.sTime).total_seconds()
+                    
+                    workers = sorted(flow.workers, key=lambda x: int(x.ip.split('.')[-1]))
+                    worker_details = ", ".join(f"{w.ip}: {w.bytes_sent} B" for w in workers)
+                    
                     log.info(
-                        f"Cycle {tp.id + 1} - Completed! "
-                        f"Workers(K): {total_cycle_workers}, Bytes(D): {tp.D}, "
-                        f"Period(T): {tp.Tv:.2f}s, Phase(ϕ): {tp.phase:.2f}s, "
-                        f"Time={tp.completion_time:.2f}s"
+                        f"Round {tp.id + 1} | Training Procedure {flow.ID} - Estimated Stats: "
+                        f"Kv={flow_K}, Dv={flow_Dv} B, Tv={flow.Tv:.2f}s, ϕv={flow.phase:.2f}s | "
+                        f"Actual Time={actual_duration:.2f}s (Ideal Bound={ideal_bound:.2f}s)"
+                    )
+                    log.info(
+                        f"Round {tp.id + 1} | Training Procedure {flow.ID} - Total Data: {flow.D} B | "
+                        f"Breakdown: [{worker_details}]"
                     )
 
 
