@@ -124,6 +124,7 @@ class Link:
 class Topology:
     def __init__(self):
         self.graph = nx.Graph()          # or DiGraph if you need directed flows
+        self.leaf_uplinks: dict[int, list[Link]] = {}
 
     def add_switch(self, switch: OVSSwitch):
         # Node key = dpid (int), node object stored as attribute
@@ -135,10 +136,45 @@ class Topology:
             link=link,
             weight=link.delay           # use delay (or 1/bandwidth) for shortest path
         )
+        
+        # Populate switch ports so we can resolve neighbors during stat polling
+        src_sw = self.get_switch(link.src_dpid)
+        if src_sw:
+            src_sw.ports[link.src_port] = SwitchPort(
+                port_no=link.src_port, hw_addr="", name="", 
+                neighbor_dpid=link.dst_dpid, neighbor_port=link.dst_port
+            )
+            
+        dst_sw = self.get_switch(link.dst_dpid)
+        if dst_sw:
+            dst_sw.ports[link.dst_port] = SwitchPort(
+                port_no=link.dst_port, hw_addr="", name="", 
+                neighbor_dpid=link.src_dpid, neighbor_port=link.src_port
+            )
 
     def get_switch(self, dpid: int) -> Optional[OVSSwitch]:
         node = self.graph.nodes.get(dpid)
         return node["switch"] if node else None
+
+    def identify_leaf_uplinks(self):
+        """
+        Builds a map of {leaf_dpid: [uplink_link_objects]} for quick lookups.
+        Assumes leaf DPIDs are < 100 and spine DPIDs are >= 100.
+        """
+        for u, v, data in self.graph.edges(data=True):
+            link = data.get("link")
+            if not link: continue
+
+            u_is_leaf, v_is_leaf = u < 100, v < 100
+            u_is_spine, v_is_spine = u >= 100, v >= 100
+
+            if u_is_leaf and v_is_spine:
+                self.leaf_uplinks.setdefault(u, []).append(link)
+            elif v_is_leaf and u_is_spine:
+                self.leaf_uplinks.setdefault(v, []).append(link)
+
+    def get_available_uplink_capacity(self, leaf_dpid: int) -> float:
+        return sum(link.residual_bandwidth for link in self.leaf_uplinks.get(leaf_dpid, []))
 
     def install_path(self, path: list[int], match_template):
         """
@@ -177,7 +213,7 @@ class Flow:
     workers: List[Worker] = field(default_factory=list)
     collector: Optional[Collector] = None
     D: int = 0
-    completion_time: float = 0
+    completion_time: float = 0.0
     phase: float = 0.0
     sTime: Optional[datetime] = None 
     ftime: Optional[datetime] = None
@@ -187,9 +223,11 @@ class TrainingProcedure:
     id: int
     flows: List[Flow] = field(default_factory=list)
     D: int = 0
-    completion_time: float = 0
+    completion_time: float = 0.0
+    start_time: Optional[datetime] = None
     phase: float = 0.0
     K: int = 0
+    Tv: float = 0.0
   
 training_procedures : List[TrainingProcedure] = []
   

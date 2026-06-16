@@ -14,10 +14,12 @@ class LoadBalancer:
         core.openflow.addListeners(self)
         self.topology = self.populate_static_topology()
         
+        self.app_start_time = datetime.now()
         self.flows = {}             # Maps flow_id -> Flow
         self.collectors = {}        # Maps flow_id -> Collector
         self.worker_to_flow = {}    # Maps worker IP -> flow_id
         self.worker_tp_ids = {}     # Maps worker IP -> current tp_id (int)
+        self.active_workers = set() # Set of IPs currently sending a burst
 
         # --- Port stats tracking ---
         # Maps (dpid, port, 'tx'|'rx') -> (last_bytes, last_timestamp)
@@ -34,8 +36,8 @@ class LoadBalancer:
         self.worker_byte_window: dict[str, tuple[int, datetime]] = {}
 
         # --- Path bookkeeping (needed to restore residual BW on FlowRemoved) ---
-        # Maps worker IP -> list of DPIDs on the installed forward path
-        self.worker_path: dict[str, list[int]] = {}
+        # Maps worker IP -> (list of DPIDs on the path, reserved_rate)
+        self.worker_path: dict[str, tuple[list[int], float]] = {}
 
         # FIX #5: poll every 2 s (was 5 s) so short bursts aren't missed.
         # The flow idle_timeout stays at 5 s; we now get at least 2 samples
@@ -43,6 +45,7 @@ class LoadBalancer:
         Timer(2, self.routine_checks, recurring=True)
         
         self.populate_mappings()
+        self.topology.identify_leaf_uplinks()
         log.info("LoadBalancer initialized. Recurring checks started.")
 
     # ------------------------------------------------------------------ #
@@ -175,7 +178,34 @@ class LoadBalancer:
             # Register ingress port so port-stats polling maps rx_bytes to this worker
             self.port_to_worker[(sw_dpid, in_port)] = src_ip
             
-            tp.K = len(self.worker_to_flow)
+            self.active_workers.add(src_ip)
+            tp.K = max(1, len(self.active_workers))
+            
+            if tp.start_time is None:
+                tp.start_time = datetime.now()
+
+                # --- Characterize Phase (ϕv) and Period (Tv) ---
+                # Find the previous cycle that involved this specific flow_id
+                prev_tp_for_this_flow = None
+                if tp_id > 0:
+                    # This search is inefficient, but acceptable for this project's scale.
+                    # A larger refactor would be needed for a cleaner data model.
+                    for i in range(tp_id - 1, -1, -1):
+                        candidate_tp = training_procedures[i]
+                        if any(f.ID == flow_id for f in candidate_tp.flows):
+                            prev_tp_for_this_flow = candidate_tp
+                            break
+                
+                if prev_tp_for_this_flow is None:
+                    # No previous cycle found for this flow, so this is the first one.
+                    # Calculate Phase (ϕv).
+                    tp.phase = (tp.start_time - self.app_start_time).total_seconds()
+                else:
+                    # A previous cycle was found. Calculate Period (Tv).
+                    if prev_tp_for_this_flow.start_time:
+                        tp.Tv = (tp.start_time - prev_tp_for_this_flow.start_time).total_seconds()
+                    # Copy the phase from the previous cycle, as it's constant for the flow.
+                    tp.phase = prev_tp_for_this_flow.phase
 
             collector = self.collectors.get(flow_id)
             if not collector:
@@ -256,13 +286,15 @@ class LoadBalancer:
 
                         # FIX #3: restore residual bandwidth along the path that was
                         # just torn down so future routing decisions see accurate values.
-                        self._restore_residual_bandwidth(src_ip_str, tp.K)
+                        self._restore_residual_bandwidth(src_ip_str)
 
                         # Advance worker to the next overlapping TP iteration
                         self.worker_tp_ids[src_ip_str] = tp_id + 1
 
                         # Reset the byte window so the next cycle starts fresh
                         self.worker_byte_window.pop(src_ip_str, None)
+
+                        self.active_workers.discard(src_ip_str)
 
     def _handle_PortStatsReceived(self, event):
         dpid = event.dpid
@@ -277,15 +309,34 @@ class LoadBalancer:
             if tx_key in self.port_stats:
                 last_tx, last_time = self.port_stats[tx_key]
                 dt = (now - last_time).total_seconds()
-                if dt > 0:
+                # Enforce minimum window to avoid math spikes, but tolerant of polling jitter
+                if dt >= 0.5:
                     tx_bitrate = ((tx_bytes - last_tx) * 8) / (dt * 1e6)
                     sw = self.topology.get_switch(dpid)
                     if sw and port_no in sw.ports:
                         neighbor_dpid = sw.ports[port_no].neighbor_dpid
                         if neighbor_dpid and self.topology.graph.has_edge(dpid, neighbor_dpid):
                             link = self.topology.graph[dpid][neighbor_dpid]["link"]
-                            link.residual_bandwidth = max(0.0, link.nominal_bandwidth - tx_bitrate)
-            self.port_stats[tx_key] = (tx_bytes, now)
+                            
+                            # Because the graph is undirected, store tx rates by source 
+                            # DPID to prevent reverse TCP ACKs from overwriting the data rate!
+                            if not hasattr(link, 'live_tx_bitrates'):
+                                link.live_tx_bitrates = {}
+                            link.live_tx_bitrates[dpid] = tx_bitrate
+                            
+                            # Check if the link is saturating (> 90 Mbps)
+                            if tx_bitrate > 90.0:
+                                neighbor_sw = self.topology.get_switch(neighbor_dpid)
+                                n_name = neighbor_sw.name if neighbor_sw else str(neighbor_dpid)
+                                
+                                # DPID 3 is l3, where the collectors are
+                                if neighbor_dpid == 3:
+                                    log.info(f"[L3 SATURATION] Final link {sw.name}->{n_name} naturally saturated at {tx_bitrate:.2f} Mbps")
+                                else:
+                                    log.warning(f"[INNER SATURATION] Inner link {sw.name}->{n_name} is unexpectedly saturated at {tx_bitrate:.2f} Mbps!")
+                    self.port_stats[tx_key] = (tx_bytes, now)
+            else:
+                self.port_stats[tx_key] = (tx_bytes, now)
 
             # FIX #1: use rx_bytes (traffic *received* from the worker) to estimate
             # the worker's actual send rate, not tx_bytes (outgoing switch traffic).
@@ -294,7 +345,7 @@ class LoadBalancer:
             if rx_key in self.port_stats:
                 last_rx, last_time = self.port_stats[rx_key]
                 dt = (now - last_time).total_seconds()
-                if dt > 0:
+                if dt >= 0.5:
                     rx_bitrate = ((rx_bytes - last_rx) * 8) / (dt * 1e6)
                     worker_ip = self.port_to_worker.get((dpid, port_no))
                     if worker_ip is not None:
@@ -305,7 +356,9 @@ class LoadBalancer:
                                 f"[LIVE RATE] Worker {worker_ip} is actively transmitting at "
                                 f"{rx_bitrate:.2f} Mbps"
                             )
-            self.port_stats[rx_key] = (rx_bytes, now)
+                    self.port_stats[rx_key] = (rx_bytes, now)
+            else:
+                self.port_stats[rx_key] = (rx_bytes, now)
 
     # ------------------------------------------------------------------ #
     # Worker registration                                                  #
@@ -358,7 +411,9 @@ class LoadBalancer:
                 return rate_mbps
 
         # 3. Pure fair-share
-        return fair_share
+        # Cap the fallback rate to prevent the very first worker 
+        # from reserving the entire 100 Mbps link!
+        return min(20.0, fair_share)
 
     # ------------------------------------------------------------------ #
     # Routing                                                              #
@@ -373,7 +428,10 @@ class LoadBalancer:
             if not link_obj.is_up:
                 return float('inf')
             if link_obj.residual_bandwidth < estimated_rate:
-                return float('inf')
+                # Add the deficit to the penalty so the algorithm gracefully
+                # balances overflow traffic across the least overloaded links!
+                deficit = estimated_rate - link_obj.residual_bandwidth
+                return 1000000.0 + deficit
             utilization = (
                 (link_obj.nominal_bandwidth - link_obj.residual_bandwidth)
                 / link_obj.nominal_bandwidth
@@ -393,8 +451,9 @@ class LoadBalancer:
                 u, v = path[i], path[i + 1]
                 graph[u][v]["link"].residual_bandwidth -= estimated_rate
 
-            # FIX #3: remember the path so we can restore BW when FlowRemoved fires
-            self.worker_path[worker.ip] = path
+            # FIX #3: remember the path AND the exact reserved rate so we can 
+            # accurately restore BW when FlowRemoved fires
+            self.worker_path[worker.ip] = (path, estimated_rate)
 
             # Install forward path rules
             topo.install_path(
@@ -445,18 +504,16 @@ class LoadBalancer:
     # Residual bandwidth restoration (FIX #3)                             #
     # ------------------------------------------------------------------ #
 
-    def _restore_residual_bandwidth(self, worker_ip: str, K: int):
+    def _restore_residual_bandwidth(self, worker_ip: str):
         """
-        When a flow expires (FlowRemoved), add back the bandwidth that was
-        reserved for it along its stored path.  Without this the residual_bandwidth
-        values drift downward over time and CSPF eventually finds no valid path.
+        When a flow expires (FlowRemoved), add back the exact bandwidth that was
+        reserved for it along its stored path.
         """
-        path = self.worker_path.pop(worker_ip, None)
-        if not path:
+        path_data = self.worker_path.pop(worker_ip, None)
+        if not path_data:
             return
 
-        # Use the last measured rate, or fall back to fair-share
-        rate = self.worker_rates.get(worker_ip, 100.0 / max(K, 1))
+        path, reserved_rate = path_data
 
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
@@ -464,10 +521,10 @@ class LoadBalancer:
                 link = self.topology.graph[u][v]["link"]
                 link.residual_bandwidth = min(
                     link.nominal_bandwidth,
-                    link.residual_bandwidth + rate
+                    link.residual_bandwidth + reserved_rate
                 )
 
-        log.debug(f"Restored {rate:.2f} Mbps along path {path} for worker {worker_ip}")
+        log.debug(f"Restored {reserved_rate:.2f} Mbps along path {path} for worker {worker_ip}")
 
     # ------------------------------------------------------------------ #
     # Routine checks                                                       #
@@ -476,6 +533,26 @@ class LoadBalancer:
     def routine_checks(self):
         self.check_residual_capacity()
         self.check_flow()
+        self.report_fabric_utilization()
+
+    def report_fabric_utilization(self):
+        """Prints a periodic summary of the most utilized links."""
+        links = []
+        for u, v, data in self.topology.graph.edges(data=True):
+            link = data.get("link")
+            if link and hasattr(link, 'live_tx_bitrates'):
+                for src_dpid, rate in link.live_tx_bitrates.items():
+                    dst_dpid = v if src_dpid == u else u
+                    if rate > 1.0:
+                        links.append((src_dpid, dst_dpid, rate))
+        
+        if not links:
+            return
+            
+        links.sort(key=lambda x: x[2], reverse=True)
+        report = [f"{self.topology.get_switch(src).name}->{self.topology.get_switch(dst).name}: {rate:.1f} Mbps" 
+                  for src, dst, rate in links[:4]]
+        log.info(f"[FABRIC LOAD] Top links: {', '.join(report)}")
 
     def check_flow(self):
         self.estimate_flow_data()
@@ -511,6 +588,7 @@ class LoadBalancer:
             if not tp.flows:
                 continue
             tp.D = sum(flow.D for flow in tp.flows)
+            total_cycle_workers = sum(len(f.workers) for f in tp.flows)
 
             is_completed = all(
                 self.worker_tp_ids.get(ip, 0) > tp.id
@@ -529,7 +607,8 @@ class LoadBalancer:
                     tp.completion_time = (end_time - start_time).total_seconds()
                     log.info(
                         f"Cycle {tp.id + 1} - Completed! "
-                        f"Total bytes: {tp.D}, Active Workers K={tp.K}, "
+                        f"Workers(K): {total_cycle_workers}, Bytes(D): {tp.D}, "
+                        f"Period(T): {tp.Tv:.2f}s, Phase(ϕ): {tp.phase:.2f}s, "
                         f"Time={tp.completion_time:.2f}s"
                     )
 

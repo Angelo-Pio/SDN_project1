@@ -117,6 +117,7 @@ def start_client(worker, target_ip, port, D_mbit, f_v, cmap):
     cmd = (
         f"iperf3 -c {target_ip} -p {port} "
         f"-n {bytes_to_send} "
+        f"-b {f_v:.2f}M "
         f"-w {window} "
         f"--set-mss 1460 --no-delay "
         f"> /dev/null 2>&1 &"
