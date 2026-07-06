@@ -8,6 +8,13 @@ from pox.lib.recoco import Timer
 
 log = core.getLogger()
 
+TP_COLORS = {
+    1: "blue",
+    2: "green",
+    3: "red",
+    4: "yellow"
+}
+
 class LoadBalancer:
 
     def __init__(self):
@@ -15,10 +22,10 @@ class LoadBalancer:
         self.topology = self.populate_static_topology()
         
         self.app_start_time = datetime.now()
-        self.flows = {}             # Maps flow_id -> Flow
-        self.collectors = {}        # Maps flow_id -> Collector
-        self.worker_to_flow = {}    # Maps worker IP -> flow_id
-        self.worker_tp_ids = {}     # Maps worker IP -> current tp_id (int)
+        self.training_procedures = {} # Maps tp_id -> TrainingProcedure
+        self.collectors = {}        # Maps tp_id -> Collector
+        self.worker_to_tp = {}      # Maps worker IP -> tp_id
+        self.worker_cycle_ids = {}  # Maps worker IP -> current cycle_id (int)
         self.active_workers = set() # Set of IPs currently sending a burst
 
         # --- Port stats tracking ---
@@ -53,10 +60,10 @@ class LoadBalancer:
     # ------------------------------------------------------------------ #
 
     def populate_mappings(self):
-        collector1 = Collector(ip="10.0.1.1", flow_id=1, connected_to_dpid=3, connected_port=1)
-        collector2 = Collector(ip="10.0.1.2", flow_id=2, connected_to_dpid=3, connected_port=2)
-        collector3 = Collector(ip="10.0.1.3", flow_id=3, connected_to_dpid=3, connected_port=3)
-        collector4 = Collector(ip="10.0.1.4", flow_id=4, connected_to_dpid=3, connected_port=4)
+        collector1 = Collector(ip="10.0.1.1", tp_id=1, connected_to_dpid=3, connected_port=1)
+        collector2 = Collector(ip="10.0.1.2", tp_id=2, connected_to_dpid=3, connected_port=2)
+        collector3 = Collector(ip="10.0.1.3", tp_id=3, connected_to_dpid=3, connected_port=3)
+        collector4 = Collector(ip="10.0.1.4", tp_id=4, connected_to_dpid=3, connected_port=4)
         self.collectors = {
             1: collector1,
             2: collector2,
@@ -64,15 +71,15 @@ class LoadBalancer:
             4: collector4
         }
 
-        flow1 = Flow(ID=1, collector=collector1)
-        flow2 = Flow(ID=2, collector=collector2)
-        flow3 = Flow(ID=3, collector=collector3)
-        flow4 = Flow(ID=4, collector=collector4)
-        self.flows = {
-            1: flow1,
-            2: flow2,
-            3: flow3,
-            4: flow4
+        tp1 = TrainingProcedure(ID=1, collector=collector1)
+        tp2 = TrainingProcedure(ID=2, collector=collector2)
+        tp3 = TrainingProcedure(ID=3, collector=collector3)
+        tp4 = TrainingProcedure(ID=4, collector=collector4)
+        self.training_procedures = {
+            1: tp1,
+            2: tp2,
+            3: tp3,
+            4: tp4
         }
 
     def populate_static_topology(self):
@@ -147,31 +154,31 @@ class LoadBalancer:
             in_port = event.port
             sw_dpid = event.dpid
 
-            flow_id = self.worker_to_flow.get(src_ip)
-            if flow_id is None:
+            tp_id = self.worker_to_tp.get(src_ip)
+            if tp_id is None:
                 for id, collector in self.collectors.items():
                     if collector.ip == dst_ip:
-                        flow_id = id
+                        tp_id = id
                         break
-            if flow_id is None:
+            if tp_id is None:
                 return
 
-            self.worker_to_flow[src_ip] = flow_id
+            self.worker_to_tp[src_ip] = tp_id
 
-            tp_id = self.worker_tp_ids.setdefault(src_ip, 0)
+            cycle_id = self.worker_cycle_ids.setdefault(src_ip, 0)
 
-            while len(training_procedures) <= tp_id:
-                training_procedures.append(TrainingProcedure(id=len(training_procedures)))
+            while len(cycles) <= cycle_id:
+                cycles.append(Cycle(id=len(cycles)))
                 
-            tp = training_procedures[tp_id]
+            cycle = cycles[cycle_id]
 
-            flow = next((f for f in tp.flows if f.ID == flow_id), None)
-            if flow is None:
-                collector = self.collectors.get(flow_id)
-                flow = Flow(ID=flow_id, collector=collector)
-                tp.flows.append(flow)
+            tp = next((t for t in cycle.training_procedures if t.ID == tp_id), None)
+            if tp is None:
+                collector = self.collectors.get(tp_id)
+                tp = TrainingProcedure(ID=tp_id, collector=collector)
+                cycle.training_procedures.append(tp)
                 
-            worker = self.register_or_update_worker(src_ip, sw_dpid, in_port, flow)
+            worker = self.register_or_update_worker(src_ip, sw_dpid, in_port, tp)
             if not worker:
                 return
 
@@ -179,33 +186,34 @@ class LoadBalancer:
             self.port_to_worker[(sw_dpid, in_port)] = src_ip
             
             self.active_workers.add(src_ip)
-            tp.K = max(1, len(self.active_workers))
+            cycle.K = max(1, len(self.active_workers))
             
-            # --- Characterize Phase (ϕv) and Period (Tv) per Flow (v) ---
-            if flow.Tv == 0.0 and flow.phase == 0.0 and flow.sTime:
-                prev_flow = None
-                if tp_id > 0:
-                    prev_tp = training_procedures[tp_id - 1]
-                    prev_flow = next((f for f in prev_tp.flows if f.ID == flow_id), None)
+            # --- Characterize Phase (ϕv) and Period (Tv) per Training Procedure (v) ---
+            if tp.Tv == 0.0 and tp.phase == 0.0 and tp.sTime:
+                prev_tp = None
+                if cycle_id > 0:
+                    prev_cycle = cycles[cycle_id - 1]
+                    prev_tp = next((t for t in prev_cycle.training_procedures if t.ID == tp_id), None)
                 
-                if prev_flow is None:
+                if prev_tp is None:
                     # This is the first time we see this training procedure.
-                    flow.phase = (flow.sTime - self.app_start_time).total_seconds()
+                    tp.phase = (tp.sTime - self.app_start_time).total_seconds()
                 else:
                     # A previous instance exists. Calculate the period.
-                    if prev_flow.sTime:
-                        flow.Tv = (flow.sTime - prev_flow.sTime).total_seconds()
+                    if prev_tp.sTime:
+                        tp.Tv = (tp.sTime - prev_tp.sTime).total_seconds()
                     # Phase is constant, so copy it from the previous instance.
-                    flow.phase = prev_flow.phase
+                    tp.phase = prev_tp.phase
 
-            collector = self.collectors.get(flow_id)
+            collector = self.collectors.get(tp_id)
             if not collector:
                 return
 
-            estimated_rate = self._estimate_worker_rate(src_ip, tp.K)
+            estimated_rate = self._estimate_worker_rate(src_ip, cycle.K)
 
+            tp_color = TP_COLORS.get(tp_id, "unknown")
             log.info(
-                f"New burst starting from {src_ip} (Flow {flow_id}, Cycle {tp_id + 1}). "
+                f"New burst starting from {src_ip} (Training Procedure {tp_id} [{tp_color}], Cycle {cycle_id + 1}). "
                 f"Initial path allocated at {estimated_rate:.2f} Mbps "
                 f"({'historical' if src_ip in self.worker_rates else 'fair-share fallback'})"
             )
@@ -230,17 +238,17 @@ class LoadBalancer:
         
         if src_ip is not None:
             src_ip_str = str(src_ip)
-            flow_id = self.worker_to_flow.get(src_ip_str)
+            tp_id = self.worker_to_tp.get(src_ip_str)
             
-            if flow_id is not None:
-                collector = self.collectors.get(flow_id)
+            if tp_id is not None:
+                collector = self.collectors.get(tp_id)
                 # Avoid double-counting: only aggregate at the collector's leaf switch
                 if collector and event.dpid == collector.connected_to_dpid:
-                    tp_id = self.worker_tp_ids.get(src_ip_str)
-                    if tp_id is not None:
-                        tp = training_procedures[tp_id]
-                        flow = next((f for f in tp.flows if f.ID == flow_id), None)
-                        if flow:
+                    cycle_id = self.worker_cycle_ids.get(src_ip_str)
+                    if cycle_id is not None:
+                        cycle = cycles[cycle_id]
+                        tp = next((t for t in cycle.training_procedures if t.ID == tp_id), None)
+                        if tp:
                             # The switch waits before sending FlowRemoved. We subtract this idle 
                             # time using hardware timers to get the exact active duration.
                             total_duration = event.ofp.duration_sec + (event.ofp.duration_nsec / 1e9)
@@ -249,12 +257,12 @@ class LoadBalancer:
 
                             # Accurately strip the idle_timeout to find the exact hardware stop time
                             actual_end_time = datetime.now() - timedelta(seconds=idle_time)
-                            if flow.ftime is None or actual_end_time > flow.ftime:
-                                flow.ftime = actual_end_time
+                            if tp.ftime is None or actual_end_time > tp.ftime:
+                                tp.ftime = actual_end_time
 
                             byte_count = event.ofp.byte_count
-                            flow.D += byte_count
-                            worker_obj = next((w for w in flow.workers if w.ip == src_ip_str), None)
+                            tp.D += byte_count
+                            worker_obj = next((w for w in tp.workers if w.ip == src_ip_str), None)
                             if worker_obj:
                                 worker_obj.bytes_sent += byte_count
 
@@ -264,8 +272,8 @@ class LoadBalancer:
                             if src_ip_str in self.worker_byte_window:
                                 prev_bytes, window_start = self.worker_byte_window[src_ip_str]
                                 self.worker_byte_window[src_ip_str] = (prev_bytes + byte_count, window_start)
-                            elif flow.sTime:
-                                self.worker_byte_window[src_ip_str] = (byte_count, flow.sTime)
+                            elif tp.sTime:
+                                self.worker_byte_window[src_ip_str] = (byte_count, tp.sTime)
 
                             # Store the highly accurate hardware-based rate
                             if byte_count > 0:
@@ -276,8 +284,9 @@ class LoadBalancer:
                                     f"{burst_rate:.2f} Mbps over {active_time:.2f}s active time"
                                 )
 
+                        tp_color = TP_COLORS.get(tp_id, "unknown")
                         log.info(
-                            f"Worker {src_ip_str} finished burst for Cycle {tp_id + 1}. "
+                            f"Worker {src_ip_str} finished burst for Cycle {cycle_id + 1} (Training Procedure {tp_id} [{tp_color}]). "
                             f"Flow bytes: {event.ofp.byte_count}"
                         )
 
@@ -286,7 +295,7 @@ class LoadBalancer:
                         self._restore_residual_bandwidth(src_ip_str)
 
                         # Advance worker to the next overlapping TP iteration
-                        self.worker_tp_ids[src_ip_str] = tp_id + 1
+                        self.worker_cycle_ids[src_ip_str] = cycle_id + 1
 
                         # Reset the byte window so the next cycle starts fresh
                         self.worker_byte_window.pop(src_ip_str, None)
@@ -361,16 +370,16 @@ class LoadBalancer:
     # Worker registration                                                  #
     # ------------------------------------------------------------------ #
 
-    def register_or_update_worker(self, ip: str, dpid: int, port: int, flow: Flow):
-        for w in flow.workers:
+    def register_or_update_worker(self, ip: str, dpid: int, port: int, tp: TrainingProcedure):
+        for w in tp.workers:
             if w.ip == ip:
                 return None  # Suppress duplicate packets within the same burst
                 
-        new_worker = Worker(ip=ip, flow_id=flow.ID, connected_to_dpid=dpid, connected_port=port)
-        flow.workers.append(new_worker)
+        new_worker = Worker(ip=ip, tp_id=tp.ID, connected_to_dpid=dpid, connected_port=port)
+        tp.workers.append(new_worker)
         
-        if flow.sTime is None:
-            flow.sTime = datetime.now()
+        if tp.sTime is None:
+            tp.sTime = datetime.now()
             
         return new_worker
 
@@ -529,7 +538,7 @@ class LoadBalancer:
 
     def routine_checks(self):
         self.check_residual_capacity()
-        self.check_flow()
+        self.check_training_status()
         self.report_fabric_utilization()
 
     def report_fabric_utilization(self):
@@ -551,9 +560,9 @@ class LoadBalancer:
                   for src, dst, rate in links[:4]]
         log.info(f"[FABRIC LOAD] Top links: {', '.join(report)}")
 
-    def check_flow(self):
-        self.estimate_flow_data()
+    def check_training_status(self):
         self.estimate_tp_data()
+        self.estimate_cycle_data()
 
     def check_residual_capacity(self):
         """Poll port stats on all connected switches."""
@@ -567,69 +576,71 @@ class LoadBalancer:
             msg = of.ofp_stats_request(body=of.ofp_port_stats_request())
             sw.connection.send(msg)
 
-    def estimate_flow_data(self):
-        for ip, tp_id in self.worker_tp_ids.items():
-            if tp_id < len(training_procedures):
-                tp = training_procedures[tp_id]
-                flow_id = self.worker_to_flow.get(ip)
-                flow = next((f for f in tp.flows if f.ID == flow_id), None)
-                if flow and flow.sTime and not flow.ftime:
-                    uptime = (datetime.now() - flow.sTime).total_seconds()
+    def estimate_tp_data(self):
+        for ip, cycle_id in self.worker_cycle_ids.items():
+            if cycle_id < len(cycles):
+                cycle = cycles[cycle_id]
+                tp_id = self.worker_to_tp.get(ip)
+                tp = next((t for t in cycle.training_procedures if t.ID == tp_id), None)
+                if tp and tp.sTime and not tp.ftime:
+                    uptime = (datetime.now() - tp.sTime).total_seconds()
+                    tp_color = TP_COLORS.get(tp.ID, "unknown")
                     log.info(
-                        f"Flow {flow.ID} (Worker {ip}) - "
-                        f"Cycle {tp.id + 1} active for {uptime:.2f}s..."
+                        f"Training Procedure {tp.ID} [{tp_color}] (Worker {ip}) - "
+                        f"Cycle {cycle.id + 1} active for {uptime:.2f}s..."
                     )
 
-    def estimate_tp_data(self):
-        for tp in training_procedures:
-            if not tp.flows:
+    def estimate_cycle_data(self):
+        for cycle in cycles:
+            if not cycle.training_procedures:
                 continue
-            tp.D = sum(flow.D for flow in tp.flows)
-            total_cycle_workers = sum(len(f.workers) for f in tp.flows)
+            cycle.D = sum(tp.D for tp in cycle.training_procedures)
+            total_cycle_workers = sum(len(t.workers) for t in cycle.training_procedures)
 
             is_completed = all(
-                self.worker_tp_ids.get(ip, 0) > tp.id
-                for ip in self.worker_to_flow
+                self.worker_cycle_ids.get(ip, 0) > cycle.id
+                for ip in self.worker_to_tp
             )
 
-            if is_completed and tp.completion_time == 0:
-                start_time = min((flow.sTime for flow in tp.flows if flow.sTime), default=None)
-                end_time = max((flow.ftime for flow in tp.flows if flow.ftime), default=None)
+            if is_completed and cycle.completion_time == 0:
+                start_time = min((tp.sTime for tp in cycle.training_procedures if tp.sTime), default=None)
+                end_time = max((tp.ftime for tp in cycle.training_procedures if tp.ftime), default=None)
                 round_duration = (end_time - start_time).total_seconds() if start_time and end_time else 0.0
                 
-                tp.completion_time = round_duration or 1  # Mark the global round as processed
+                cycle.completion_time = round_duration or 1  # Mark the global round as processed
                 
                 log.info(
-                    f"=== ROUND {tp.id + 1} GLOBAL SUMMARY === "
-                    f"Total Workers: {total_cycle_workers}, Total Data: {tp.D} B, "
+                    f"=== ROUND {cycle.id + 1} GLOBAL SUMMARY === "
+                    f"Total Workers: {total_cycle_workers}, Total Data: {cycle.D} B, "
                     f"Global Completion Time: {round_duration:.2f}s"
                 )
                 
-                for flow in tp.flows:
-                    if not flow.workers:
+                for tp in cycle.training_procedures:
+                    if not tp.workers:
                         continue
                         
                     # Calculate stats for this specific training procedure (v)
-                    flow_K = len(flow.workers)
-                    flow_Dv = int(flow.D / max(1, flow_K))
+                    tp_K = len(tp.workers)
+                    tp_Dv = int(tp.D / max(1, tp_K))
                     # Ideal completion time Tv = (Kv*Dv)/Cv, where Cv=100Mbps
-                    ideal_bound = (flow.D * 8) / (100.0 * 1e6)
+                    ideal_bound = (tp.D * 8) / (100.0 * 1e6)
                     
                     # Actual measured completion time for this procedure
                     actual_duration = 0.0
-                    if flow.sTime and flow.ftime:
-                        actual_duration = (flow.ftime - flow.sTime).total_seconds()
+                    if tp.sTime and tp.ftime:
+                        actual_duration = (tp.ftime - tp.sTime).total_seconds()
                     
-                    workers = sorted(flow.workers, key=lambda x: int(x.ip.split('.')[-1]))
+                    workers = sorted(tp.workers, key=lambda x: int(x.ip.split('.')[-1]))
                     worker_details = ", ".join(f"{w.ip}: {w.bytes_sent} B" for w in workers)
                     
+                    tp_color = TP_COLORS.get(tp.ID, "unknown")
                     log.info(
-                        f"Round {tp.id + 1} | Training Procedure {flow.ID} - Estimated Stats: "
-                        f"Kv={flow_K}, Dv={flow_Dv} B, Tv={flow.Tv:.2f}s, ϕv={flow.phase:.2f}s | "
+                        f"Round {cycle.id + 1} | Training Procedure {tp.ID} [{tp_color}] - Estimated Stats: "
+                        f"Kv={tp_K}, Dv={tp_Dv} B, Tv={tp.Tv:.2f}s, ϕv={tp.phase:.2f}s | "
                         f"Actual Time={actual_duration:.2f}s (Ideal Bound={ideal_bound:.2f}s)"
                     )
                     log.info(
-                        f"Round {tp.id + 1} | Training Procedure {flow.ID} - Total Data: {flow.D} B | "
+                        f"Round {cycle.id + 1} | Training Procedure {tp.ID} [{tp_color}] - Total Data: {tp.D} B | "
                         f"Breakdown: [{worker_details}]"
                     )
 

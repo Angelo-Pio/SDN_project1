@@ -180,7 +180,7 @@ class Topology:
 @dataclass
 class Worker:
     ip: str
-    flow_id: int
+    tp_id: int
     connected_to_dpid: Optional[int] = None
     connected_port: Optional[int] = None
     bytes_sent: int = 0
@@ -188,12 +188,12 @@ class Worker:
 @dataclass
 class Collector:
     ip: str
-    flow_id: int
+    tp_id: int
     connected_to_dpid: Optional[int] = None
     connected_port: Optional[int] = None
     
 @dataclass
-class Flow:
+class TrainingProcedure:
     ID: int 
     workers: List[Worker] = field(default_factory=list)
     collector: Optional[Collector] = None
@@ -205,9 +205,9 @@ class Flow:
     ftime: Optional[datetime] = None
 
 @dataclass
-class TrainingProcedure:
+class Cycle:
     id: int
-    flows: List[Flow] = field(default_factory=list)
+    training_procedures: List[TrainingProcedure] = field(default_factory=list)
     D: int = 0
     completion_time: float = 0.0
     start_time: Optional[datetime] = None
@@ -215,4 +215,4 @@ class TrainingProcedure:
     K: int = 0
     Tv: float = 0.0
   
-training_procedures : List[TrainingProcedure] = []
+cycles : List[Cycle] = []
