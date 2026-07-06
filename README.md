@@ -16,7 +16,7 @@ The network is emulated using Katharà and forms a 2-tier leaf-spine topology:
 ![Network Topology](topology.png)
 
 ## Usage ##
-1. Move to the `src` folder and nstall Python requirements with
+1. Move to the `src` folder and install Python requirements with
 ```
 pip install -r requirements.txt
 ```
