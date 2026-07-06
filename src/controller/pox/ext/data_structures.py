@@ -5,22 +5,6 @@ from dataclasses import dataclass, field
 from pox.lib.util import dpid_to_str
 from pox.openflow.libopenflow_01 import ofp_flow_mod, ofp_action_output, OFPFF_SEND_FLOW_REM
 
-
-# For each training procedure v you need to mantain:
-# ! Global structures:
-# Graph(N,L) , node , link 
-# Node: ID, type : collector, worker, switch , {link : ip} 
-# Link: src_node, dst_node, residual_capacity , src_ip, dst_ip
-# Capacity = 100 #Mbps
-# * Set of workers: W -> division of workers by "color" subsets
-# * Worker: IP, flow_id, 
-# * Collector: IP, flow_id
-# * Flow: workers, collector, ID , Dv , Tv = null, phase = null, stime = first time at which traffic from a worker
-# * that belongs to the flow has been detected, ftime = last time ... 
-# * Training_Procedure [ (Flows, D, T , phase, K), (Flows) ]  
-
-
-
 @dataclass
 class SwitchPort:
     """Represents a physical or virtual port on a switch."""
@@ -232,20 +216,3 @@ class TrainingProcedure:
     Tv: float = 0.0
   
 training_procedures : List[TrainingProcedure] = []
-  
-
-
-#! Global Variables
-
-# Graph
-# Current_procedure_id
-# TrainingProcedures = []
-# Capacity
-
-
-
-# TODO:
-# 1. Finalizing graph, node and link data structures
-# 2. Populating statically the grah with netw topology and collectors
-# 3. Undestrand how to discover workers and populate Flow.workers for a Flow 
-# 4. Undestainding how to update link residual_capacity(how much data coming from a worker etc.)
