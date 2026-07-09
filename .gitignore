@@ -9,15 +9,10 @@ env/
 .env/
 pyenv/
 
-src/shared/logs/*
-src/shared/pkt_captures/*
 # Python Cache
 __pycache__/
 *.py[cod]
 *$py.class
-
-# P4 Compiled Output
-*.json
 
 # Editor and OS Junk
 .vscode/
@@ -27,4 +22,3 @@ __pycache__/
 
 *_tx.txt
 *_rx.txt
-*.log
