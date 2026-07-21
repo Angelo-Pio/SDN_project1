@@ -52,9 +52,9 @@ Once the traffic profile is characterized, the controller coordinates routing to
 
 #### Rate Estimation ####
 Before routing, the controller estimates the worker's tramission speed:
-- for the initial burst, it uses a conservative fair-share fallback of $100/K_v$ Mbps, capped at 20 Mbps;
+- for the initial burst, it uses a dynamic fair-share fallback of $100/K_{expected}$ Mbps based on active and discovered workers;
 - for currently active bursts, it polls the switches every 2 seconds to measure the current transmission speed.
-- for subsequent bursts, it uses the worker's historical hardware rate calculated from the previous cycle's `FlowRemoved` event.
+- for subsequent bursts, it uses the worker's historical hardware rate (from `FlowRemoved`), bounded by the dynamic fair-share ceiling ($\min(\text{rate}_{\text{hist}}, 100/K_{expected})$) to prevent link over-reservation when multiple flows burst concurrently.
 
 #### Constrained Shortest Path First ####
 With the estimated rate, the controller runs a CSPF algorithm over the topology.

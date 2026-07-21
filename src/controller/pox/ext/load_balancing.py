@@ -209,7 +209,7 @@ class LoadBalancer:
             if not collector:
                 return
 
-            estimated_rate = self._estimate_worker_rate(src_ip, cycle.K)
+            estimated_rate = self._estimate_worker_rate(src_ip, cycle.K, tp)
 
             tp_color = TP_COLORS.get(tp_id, "unknown")
             log.info(
@@ -387,26 +387,32 @@ class LoadBalancer:
     # Rate estimation                                                      #
     # ------------------------------------------------------------------ #
 
-    def _estimate_worker_rate(self, worker_ip: str, K: int) -> float:
+    def _estimate_worker_rate(self, worker_ip: str, K: int, tp: TrainingProcedure = None) -> float:
         """
         Return the best available Mbps estimate for *worker_ip*.
 
         Priority order:
           1. A fresh measurement from port-stats polling (rx_bytes on ingress port),
-             or a burst-derived rate stored at FlowRemoved time. Both live in
-             self.worker_rates and are more accurate than any fallback.
+             or a burst-derived rate stored at FlowRemoved time. Capped by the current
+             fair-share ceiling when multiple flows burst concurrently.
           2. A rate derived from bytes accumulated in the current byte-count window
              (self.worker_byte_window) — updated on every FlowRemoved event.
-          3. A conservative fair-share fallback: link_capacity / K.
-
-        FIX #4: the measured rate is no longer capped at fair_share. Heavy workers
-        are logged as warnings in _handle_PortStatsReceived instead.
+          3. Dynamic fair-share fallback: link_capacity / max_expected_K.
         """
-        fair_share = 100.0 / max(K, 1)
+        # Calculate the dynamic fair-share ceiling for current network scale
+        expected_k = K
+        if tp and len(tp.workers) > expected_k:
+            expected_k = len(tp.workers)
+        if len(self.active_workers) > expected_k:
+            expected_k = len(self.active_workers)
+        if len(self.worker_to_tp) > expected_k:
+            expected_k = len(self.worker_to_tp)
+
+        fair_share_ceiling = 100.0 / max(expected_k, 1)
 
         # 1. Port-stats rx measurement or previous-burst-derived rate
         if worker_ip in self.worker_rates and self.worker_rates[worker_ip] > 0:
-            return self.worker_rates[worker_ip]
+            return min(self.worker_rates[worker_ip], fair_share_ceiling)
 
         # 2. Byte-window fallback (coarser, derived from FlowRemoved byte counts)
         if worker_ip in self.worker_byte_window:
@@ -414,12 +420,11 @@ class LoadBalancer:
             elapsed = (datetime.now() - window_start).total_seconds()
             if elapsed > 0:
                 rate_mbps = (acc_bytes * 8) / (elapsed * 1e6)
-                return rate_mbps
+                if rate_mbps > 0.1:
+                    return min(rate_mbps, fair_share_ceiling)
 
-        # 3. Pure fair-share
-        # Cap the fallback rate to prevent the very first worker 
-        # from reserving the entire 100 Mbps link!
-        return min(20.0, fair_share)
+        # 3. Dynamic fair-share fallback
+        return fair_share_ceiling
 
     # ------------------------------------------------------------------ #
     # Routing                                                              #
